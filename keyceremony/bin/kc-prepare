@@ -1,0 +1,136 @@
+#!/bin/bash
+
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/root/bin
+
+now()
+{
+	date '+%Y%m%d-%H%M'
+}
+
+# Make sure we use UTC
+rm -f /etc/localtime
+ln -s /usr/share/zoneinfo/UTC /etc/localtime
+
+ok=0
+while [ $ok = 0 ]
+do
+	echo
+	echo "The computer believes the time in UTC now is" `now`
+	read -n 1 -p "Is this time correct in UTC?: " answer
+	echo
+	if [ "$answer" = "y" -o "$answer" = "Y" ]
+	then
+		ok=1
+	else
+		year=
+		while [ -z "$year" ]
+		do
+			read -p "Enter the year: " year
+		done
+		month=
+		while [ -z "$month" ]
+		do
+			read -p "Enter the month number: " month
+		done
+		daynumber=
+		while [ -z "$daynumber" ]
+		do
+			read -p "Enter the daynumber of this month: " daynumber
+		done
+		hours=
+		while [ -z "$hours" ]
+		do
+			read -p "Enter the hours: " hours
+		done
+		minutes=
+		while [ -z "$minutes" ]
+		do
+			read -p "Enter the minutes: " minutes
+		done
+		if [ "$year" -lt 100 ]
+		then
+			year="20$year"
+		fi
+		if [ "$month" -lt 10 ]
+		then
+			month="0$month"
+		fi
+		if [ "$daynumber" -lt 10 ]
+		then
+			daynumber="0$daynumber"
+		fi
+		if [ "$hours" -lt 10 ]
+		then
+			hours="0$hours"
+		fi
+		if [ "$minutes" -lt 10 ]
+		then
+			minutes="0$minutes"
+		fi
+		ok=0
+		if date ${month}${daynumber}${hours}${minutes}${year}
+		then
+			ok=1
+		fi
+	fi
+done
+
+echo Waiting for new USB.
+echo BEWARE that the USB will be formatted.
+usb=`newdevice | head -1`
+echo Found $usb;
+
+device=`echo $usb | awk '{print $1}'`
+
+if [ -z "$device" ]
+then
+	echo Did not detect a new device. >&2
+	exit 1
+fi
+
+# Get size of USB
+size=`blockdev --getsz $device`
+if [ -z "$size" ]
+then
+	exit 1
+fi
+
+if [ "$size" -lt 10240 ]
+then
+	echo The USB is too small. >&2
+	exit 1
+fi
+
+# Format the USB and make a single partition
+echo "Erasing $device , creating new partition table and creating a single partition."
+parted -s $device unit s mklabel msdos mkpart primary fat32 8064 $(( $size - 1 )) || exit 1
+partition=`lsblk --list --output name --paths $usb | tail -1`
+echo "Formatting $partition".
+mkfs -t msdos -n PY-KC-LOGS $partition || exit 1
+
+# Mount the partition
+path=/root/logs
+test -d $path || mkdir $path || exit 1
+echo Mouting $partition on $path
+mount $partition $path || exit 1
+
+# Go to the partition and start logging
+cd $path || exit 1
+
+echo 
+echo 
+echo You are now ready to start the key ceremony.
+echo Everything appearing on the screen of this shell will
+echo be logged, until you exit it.
+echo 
+echo
+file=keyceremonylog-`now`
+script $file
+echo
+echo
+echo Logged session ended.
+echo The sha256sum of $file is `sha256sum $file | perl -pe 's/\s.*$//;s/(....)/$1 /g'`
+
+cd /
+umount /root/logs && exit 1
+echo You can now remove the USB called \"logs\"

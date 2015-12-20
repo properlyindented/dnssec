@@ -1,0 +1,38 @@
+#!/usr/bin/perl -w
+# 20151215 Robert Martin-Legene
+# Runs in a loop until a new device is detected (e.g. USB FD)
+use warnings;
+use strict;
+use Time::HiRes 'sleep';
+
+sub lsblk
+{
+	return split(/\n/, ` lsblk --output name --paths --list @_ | tail -n +2 ` );
+}
+
+sub newdevice
+{
+	my @blockdevs = lsblk('--nodeps');
+	my @now = @blockdevs;
+	while ($#blockdevs >= $#now)
+	{
+		sleep 0.25;
+		@blockdevs = @now;
+		@now = lsblk('--nodeps');
+	}
+	foreach my $dev ( @blockdevs )
+	{
+		my $pos = $#now+1;
+		while ($pos-- > 0)
+		{
+			splice(@now, $pos, 1) if $now[$pos] eq $dev;
+		}
+	}
+	my $device = undef;
+	$device = $now[0] if @now;
+	return if not defined $device;
+	system " lsblk --output name --paths --list $device | tail -n +2 ";
+	return;
+}
+
+newdevice();

@@ -1,0 +1,24 @@
+#!/bin/bash
+# 20151215 Robert Martin-Legene
+
+echo "Insert a USB FD with a single partition which contains a file called extras.tar"
+partition=`newdevice | tail`
+mountpoint=/root/extras
+test -d $mountpoint || mkdir $mountpoint || exit 1
+mount $partition $mountpoint
+file=/mountpoint/extras.tar
+if [ ! -r $file ]
+then
+	echo Can not find or not read $file >&2
+	exit 1
+fi
+
+echo The sha256sum of `basename $file` is `sha256sum $file | perl -pe 's/\s.*$//;s/(....)/$1 /g'`
+echo Saving a copy on the logs USB FD.
+cp -p $file /root/logs/`basename $file`
+echo Extracting `basename $file` to `pwd`
+tar xvf $file
+echo Unmounting $partition
+umount $mountpoint || exit 1
+echo You may now remove the USB FD.
+rmdir $mountpoint || exit 1

@@ -1,0 +1,538 @@
+#!/usr/bin/perl -w
+
+use warnings;
+use strict;
+use IO::File;
+use IO::Dir;
+use Fcntl;
+use IPC::Open2;
+
+use constant {
+	BITS		=>	4096,
+	RANDOMDEV	=>	'/dev/random',
+	THRESHOLD	=>	3,
+	SHARES		=>	8,
+	ZONE		=>	'templatezone',
+	SYMBITS		=>	1024,
+	CRYPTOALG	=>	'aes-256-cbc',
+	CHARS		=>	'abcdefghijklmnopqrstuvwxyz0123456789',
+};
+
+my $ksksecret = undef;
+my $ksksecretfile = 'PY cryptokey';
+my $zsksecret = undef;
+my $zsksecretfile = 'PY zsk secret';
+
+sub setup
+{
+	$ENV{'PATH'} .= '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/root/bin';
+	umask 077;
+	my $dir = undef;
+	my $max = 1000;
+	while ($max-- > 0)
+	{
+		$dir = '/tmp/tmp.';
+		for (my $i = 8; $i > 0; $i--)
+		{
+			$dir .= substr( CHARS, int(rand(length(CHARS))), 1);
+		}
+		mkdir ($dir, 0700) && last;
+		$dir=undef;
+	}
+	exit 1 if not defined $dir;
+	chdir $dir or die $!;
+}
+
+sub myexec
+{
+	printf "Executing: %s\n", join(' ', @_);
+	system @_;
+	return 1 if $? == 0;
+	if ($? == -1) {
+		print "failed to execute: $!\n";
+	}
+	elsif ($? & 127) {
+		printf "child died with signal %d, %s coredump\n",
+		($? & 127),  ($? & 128) ? 'with' : 'without';
+	}
+	return 0;
+}
+
+sub myopen2(\$\$@)
+{
+	my ($out, $in, @cmd) = @_;
+	printf "Executing: %s\n", join(' ', @cmd);
+	my $pid = open2($$out, $$in, @cmd);
+	die $! if not defined $pid;
+	return $pid;
+}
+
+sub genkey
+{
+	my ($keytype, $BITS, $zone) = @_;
+	my @keytype = ();
+	@keytype = ('-f', $keytype) if uc($keytype) eq 'KSK';
+	printf "Generating %d bit key for %s\n", $BITS, $zone;
+	myexec('dnssec-keygen',
+		'-q',
+		'-3',
+		'-a',
+		'RSASHA256',
+		'-b', $BITS,
+		@keytype,
+		'-L', 86400,
+		'-r', RANDOMDEV,
+		$zone
+	) || exit 1;
+}
+
+sub packit
+{
+	my $archive = shift;
+	print "Packing key into $archive.\n";
+	myexec('tar', '-cf', $archive, @_) || exit 1;
+}
+
+sub gensecret
+{
+	my ($bits) = @_;
+	print "Generating secret for the symmetric encryption.\n";
+	my $secret = undef;
+        my ($chld_out, $chld_in);
+        my $pid = myopen2($chld_out, $chld_in, sprintf(
+			"openssl rand -rand %s -hex %d 2>/dev/null",
+			RANDOMDEV,
+			int($bits/8),
+	));
+	while (local $_ = $chld_out->getline)
+	{
+		s/[\r\n]+$//;
+		# sometimes it says junk first
+		$secret = $_;
+	}
+        waitpid $pid, 0; #reap
+        my $child_exit_status = $? >> 8;
+	die "ssss-combine returned with a failure" if $child_exit_status;
+	die "unable to create secret" if length($secret)*4 != $bits;
+	die "unable to create secret" if not defined $secret;
+	return $secret;
+}
+
+sub reconstructsecret
+{
+	my ($threshold, $secretfile) = @_;
+	my @parts = ();
+	my $i = 0;
+	while ($i < $threshold)
+	{
+		printf "%d/%d: Insert a %s.\n", $i+1, $threshold, $secretfile;
+		my @tmp = split /\s+/, `newdevice`;
+		my $device = shift @tmp;
+		my $partition = shift @tmp;
+		printf "Mounting %s\n", $partition;
+		if (myexec("mount $partition /mnt"))
+		{
+			my @files = <"/mnt/$secretfile *">;
+			if (@files)
+			{
+				for my $filename (@files) {
+					printf "Opening \"%s\".\n", $filename;
+					my $file = IO::File->new($filename) or die "$filename: $!, stopped";
+					my $share = $file->getline;
+					$file->close;
+					$share =~ s/[\r\n]+$//;
+					# probably a good minimum length
+					if ( $share =~ m/^(?:([^\-]+)-)?(\d+)-([a-zA-Z0-9]{32,})$/ )
+					{
+						my ($name, $num, $secrrt) = ($1, $2, $3);
+						$name = 'secret' if not defined $name;
+						if (grep /^$share$/, @parts)
+						{
+							print "We already read part $num.\n";
+						}
+						else {
+							push @parts, $share;
+							$i++;
+							print "Successfully read share #$num of $name.\n";
+						}
+					}
+					else {
+						printf STDERR "The file %s didn't seem to contain any \"%s\".\n", $filename, $secretfile;
+					}
+				}
+			}
+			else {
+				printf STDERR "There are no %s files on this device.\n", $secretfile;
+			}
+			myexec("umount $partition") or die;
+			print "You may now remove the device.\n";
+		}
+		else {
+			print STDERR "Failed to mount $partition. Remove $device and try again.\n";
+		}
+		print "\n";
+	}
+	my $secret = ssss_combine( $threshold, @parts );
+	printf "Secret recreated in-memory.\n";
+	return $secret;
+}
+
+sub secretsharestomedia
+{
+	my ($secretfile) = @_;
+	my @parts = <"$ksksecretfile *">;
+	my $threshold = $#parts + 1;
+	my $i = 0;
+	while ($i < $threshold)
+	{
+		printf "Insert the \"%s %d de %d\" USB FD now.\nBEWARE that the USB will be formatted.\n", $secretfile, $i+1, $threshold;
+		my @tmp = split /\s+/, `newdevice`;
+		if (not @tmp)
+		{
+			printf STDERR "That failed.\n"
+		}
+		else {
+			my $device = shift @tmp;
+			printf "Found %s\n", $device;
+			my $partition = shift @tmp;
+			# Get size of USB
+			my $size=`blockdev --getsz $device`;
+			die "$device has no size?" if not defined $size or $size eq '';
+			die "$device is too small" if $size -lt 10240;
+			# Format the USB and make a single partition
+#echo "Erasing $device , creating new partition table and creating a single partition."
+#parted -s $device unit s mklabel msdos mkpart primary fat32 8064 $(( $size - 1 )) || exit 1
+#partition=`lsblk --list --output name --paths $usb | tail -1`
+#echo "Formatting $partition".
+#mkfs -t msdos -n PY-KC-LOGS $partition || exit 1
+#
+## Mount the partition
+#path=/root/logs
+#test -d $path || mkdir $path || exit 1
+#echo Mouting $partition on $path
+#mount $partition $path || exit 1
+
+	## UNFINISHED
+		}	
+
+		printf "Mounting %s\n", $partition;
+		if (myexec("mount $partition /mnt"))
+		{
+			my @files = <"/mnt/$secretfile *">;
+			if (@files)
+			{
+				for my $filename (@files) {
+					printf "Opening \"%s\".\n", $filename;
+					my $file = IO::File->new($filename) or die "$filename: $!, stopped";
+					my $share = $file->getline;
+					$file->close;
+					$share =~ s/[\r\n]+$//;
+					# probably a good minimum length
+					if ( $share =~ m/^(?:([^\-]+)-)?(\d+)-([a-zA-Z0-9]{32,})$/ )
+					{
+						my ($name, $num, $secrrt) = ($1, $2, $3);
+						$name = 'secret' if not defined $name;
+						if (grep /^$share$/, @parts)
+						{
+							print "We already read part $num.\n";
+						}
+						else {
+							push @parts, $share;
+							$i++;
+							print "Successfully read share #$num of $name.\n";
+						}
+					}
+					else {
+						printf STDERR "The file %s didn't seem to contain any \"%s\".\n", $filename, $secretfile;
+					}
+				}
+			}
+			else {
+				printf STDERR "There are no %s files on this device.\n", $secretfile;
+			}
+			myexec("umount $partition") or die;
+			print "You may now remove the device.\n";
+		}
+		else {
+			print STDERR "Failed to mount $partition. Remove $device and try again.\n";
+		}
+		print "\n";
+	}
+	my $secret = ssss_combine( $threshold, @parts );
+	printf "Secret recreated in-memory.\n";
+	return $secret;
+}
+
+sub encrypt
+{
+	my ($secret, $infile, $outfile) = @_;
+	die "No secret defined.\n" if not defined $secret;
+	printf("Encrypting %s package using %s.\n", $infile, CRYPTOALG);
+        my ($chld_out, $chld_in);
+        my $pid = myopen2($chld_out, $chld_in, sprintf(
+		'openssl %s -e -pass stdin -in %s -out %s',
+			CRYPTOALG,
+			$infile,
+			$outfile
+		)
+	);
+	$chld_in->print($secret);
+	$chld_in->close;
+	print $chld_out->getlines;
+	$chld_out->close;
+        waitpid $pid, 0; #reap
+        my $child_exit_status = $? >> 8;
+	die "encrypt returned with a failure" if $child_exit_status;
+	# verify
+	my $verify = $infile . '.verify';
+	decrypt($secret, $outfile, $verify);
+	myexec("cmp --silent $infile $verify") || exit 1;
+	unlink $verify;
+	#
+}
+
+sub decrypt
+{
+	my ($secret, $infile, $outfile) = @_;
+	die "No secret defined.\n" if not defined $secret;
+        my ($chld_out, $chld_in);
+        my $pid = myopen2($chld_out, $chld_in, sprintf(
+		'openssl %s -d -pass stdin -in %s -out %s',
+			CRYPTOALG,
+			$infile,
+			$outfile
+		)
+	);
+	$chld_in->print($secret);
+	$chld_in->close;
+	print $chld_out->getlines;
+	$chld_out->close;
+        waitpid $pid, 0; #reap
+        my $child_exit_status = $? >> 8;
+	die "encrypt returned with a failure" if $child_exit_status;
+}
+
+sub ssss_split
+{
+	my ($thissecret, $outpattern, $threshold, $shares) = @_;
+	die "No secret defined.\n" if not defined $thissecret;
+	printf "Splitting secret into M of N (%d of %s) parts.\n",
+		$threshold, $shares;
+        my ($chld_out, $chld_in);
+        my $pid = myopen2($chld_out, $chld_in, "ssss-split -t $threshold -n $shares -x -Q -w dnsseckey");
+	$chld_in->print( $thissecret, "\n" );
+	$chld_in->close;
+	my $i = 0;
+	while (local $_ = $chld_out->getline)
+	{
+		my $filename = sprintf '%s part %d of %d', $outpattern, ++$i, $shares;
+		my $file = IO::File->new($filename, O_WRONLY|O_CREAT|O_TRUNC)
+			or die $!;
+		$file->print($_);
+		$file->close;
+	}
+	$chld_out->close;
+        waitpid $pid, 0; #reap
+        my $child_exit_status = $? >> 8;
+	die "ssss-split returned with a failure, stop"
+		if $child_exit_status;
+	# verify
+	my @files = <"$outpattern *">;
+	my @_parts = ();
+	while ($#_parts + 1 < $threshold)
+	{
+		my $file = shift @files;
+		my $fh = IO::File->new(shift @files) or die $!;
+		local $_ = $fh->getline;
+		$fh->close;
+		s/[\r\n]+$//;
+		push @_parts, $_;
+	}
+	my $verify = ssss_combine( $threshold, @_parts );
+	die "failed to reproduce secret, stopped" if $verify ne $thissecret;
+	#
+}
+
+sub ssss_combine
+{
+	my ($threshold, @_parts) = @_;
+        my ($chld_out, $chld_in);
+        my $pid = myopen2($chld_out, $chld_in, "ssss-combine -t $threshold -x -Q 2>&1");
+	foreach my $part (@_parts)
+	{
+		$chld_in->print( "$part\n" );
+	}
+	$chld_in->close;
+	my $result = join('', $chld_out->getlines);
+	$result =~ s/[\r\n]+$//;
+	$chld_out->close;
+        waitpid $pid, 0; #reap
+        my $child_exit_status = $? >> 8;
+	if ( $child_exit_status )
+	{
+		print STDERR "** $result\n";
+		die "ssss-combine returned with exit code $child_exit_status, stop";
+	}
+	return $result;
+}
+
+sub copy
+{
+	my ($filename) = @_;
+	if (not -e $filename) {
+		print STDERR "There is no $filename to copy.\n";
+		return;
+	}
+	print "Insert a formatted removable media.\n";
+	my @tmp = split /\s+/, `newdevice`;
+	my $device = shift @tmp;
+	my $partition = shift @tmp;
+	printf "Mounting %s\n", $partition;
+	if (not myexec("mount $partition /mnt"))
+	{
+		print STDERR "Failed to mount $partition. Remove $device and try again.\n";
+		return;
+	}
+	if (not myexec('cp', '-p', $filename, "/mnt/$filename"))
+	{
+		print "NOTE: Copying failed.\n";
+		return;
+	}
+	myexec("umount $partition") or die;
+	print "You may now remove the device.\n";
+}
+
+sub background
+{
+	printf "Executing in background: %s\n", join(' ', @_);
+	my $pid = fork();
+	die $! if not defined $pid;
+	if ($pid > 0) {
+		sleep 2;
+	}
+	else {
+		exec @_ or die $!;
+	}
+}
+
+sub araneus
+{
+	my $dev="/root/araneus-random-device";
+	unlink $dev;
+	# See if we are already running the rngd.
+	# The araneus-random-number generator does when rngd gets killed,
+	# so we hope this is sufficient to detect the state.
+	if ( -e '/var/run/rngd.pid' )
+	{
+		my $pid = `cat /var/run/rngd.pid`;
+		if (kill 0, $pid)
+		{
+			print STDERR "It looks like the random numbers are already working.\n";
+			return;
+		}
+	}
+	print "Making FIFO pipe.\n";
+	myexec('mknod', $dev, 'p') or die $!;
+	print "Starting hardware True Random Number Generator.\n";
+	background("araneus-random-number -b > $dev");
+	myexec("rngd --rng-quality=high --rng-device=$dev --fill-watermark=100 --rng-timeout=0") or die $!;
+}
+
+sub menu
+{
+	$| = 1;
+	my $choice = '';
+	while ($choice ne 'Q')
+	{
+		my (@_ksk, @_zsk, @_random, @_misc);
+		push @_ksk,    'KSK';
+		push @_ksk,    '[ KS ] Generate PY-cryptokey secret for KSK storage.'	if not defined $ksksecret;
+		push @_ksk,    '[ KR ] Reconstruct PY-cryptokey secret from shares.'	if not defined $ksksecret;
+		push @_ksk,    '[ KF ] Forget PY-cryptokey (memory version).'		if defined $ksksecret;
+		push @_ksk,    '[ KU ] Copy PY-cryptokey to USB shares.'		if <"$ksksecretfile *">;
+		push @_ksk,    '[ KG ] Generate KSK'					if not -e 'ksk.tar' and not -e 'ksk.tar.'.CRYPTOALG;
+		push @_ksk,    '[ KE ] KSK encrypt.'					if defined $ksksecret and -e 'ksk.tar' and not -e 'ksk.tar.'.CRYPTOALG;
+		push @_ksk,    '[ KC ] Copy encrypted KSK to removable media.'		if -e 'ksk.tar.'.CRYPTOALG;
+		push @_zsk,    'ZSK';
+		push @_zsk,    '[ ZS ] Generate secret for ZSK transport.'		if not defined $zsksecret;
+	#	push @_zsk,    '[ ZR ] Reconstruct ZSK secret from shares.'		if not defined $zsksecret;
+		push @_zsk,    '[ ZF ] Forget ZSK secret (memory version).'		if defined $zsksecret;
+		push @_zsk,    '[ ZG ] Generate ZSK key.'				if defined $zsksecret;
+		push @_zsk,    '[ ZC ] Copy ZSK to removable media.'			if -e 'zsk.tar.'.CRYPTOALG;;
+		push @_misc,   'Misc';
+		push @_misc,   '[ CS ] Ceremony sign.'					if -e 'ksk.tar';
+		push @_misc,   '[ R  ] start Random number generator.';
+		push @_misc,   '[ Q  ] Quit.';
+		print "\n";
+		# Print out the menus
+		for my $sectionref ( \@_ksk, \@_zsk, \@_random, \@_misc )
+		{
+			my @list = @$sectionref;
+			if ($#list > 0)
+			{
+				for my $line ( @list )
+				{
+					printf "%s\n", $line;
+				}
+			}
+		}
+		print ":: ";
+		$choice = uc <>;
+		print "\n";
+
+		exit if not defined $choice;
+		$choice =~ s/[\r\n]+//g;
+		# KSK
+		if    ($choice eq 'KS') {
+			$ksksecret = gensecret( SYMBITS );
+			ssss_split($ksksecret, $ksksecretfile, THRESHOLD, SHARES);
+		}
+		elsif ($choice eq 'KR') {	
+			$ksksecret = reconstructsecret( 3, $ksksecretfile );
+		}
+		elsif ($choice eq 'KF') {	
+			$ksksecret = undef;
+			print "PY-cryptokey secret removed from memory.\n";
+		}
+		elsif ($choice eq 'KU') {	
+			secretsharestomedia( $ksksecretfile )
+		}
+		elsif ($choice eq 'KG') {
+			genkey('KSK', 4096, ZONE);
+			packit('ksk.tar', <K*>);
+			unlink <K*>;
+		}
+		elsif ($choice eq 'KE') {
+			encrypt($ksksecret, 'ksk.tar', 'ksk.tar.'.CRYPTOALG);
+			unlink 'ksk.tar';
+		}
+		elsif ($choice eq 'KC') {
+			copy('ksk.tar.'.CRYPTOALG);
+		}
+		# ZSK
+		if    ($choice eq 'ZS') {
+			$zsksecret = gensecret( SYMBITS );
+			ssss_split($zsksecret, $zsksecretfile, THRESHOLD, SHARES);
+		}
+		elsif ($choice eq 'ZR') {	
+			$zsksecret = reconstructsecret( 2, $zsksecretfile );
+		}
+		elsif ($choice eq 'ZF') {	
+			$zsksecret = undef;
+			print "ZSK secret removed from memory.\n";
+		}
+		elsif ($choice eq 'ZG') {
+			genkey('ZSK', 2048, ZONE);
+			packit('zsk.tar', <K*>);
+			unlink <K*>;
+		}
+		# MISC
+		elsif ($choice eq 'R') {
+			araneus();
+		}
+	}
+}
+
+setup;
+menu;
+

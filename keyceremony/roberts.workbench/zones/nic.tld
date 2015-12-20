@@ -1,0 +1,8 @@
+$TTL	    900
+$ORIGIN	    nic.tld.
+@	    SOA	a hostmaster 1 3600 900 2415600 900
+	    NS	a
+
+a           A   10.10.10.10
+
+$INCLUDE "keys/nic.tld.dnskeys"
