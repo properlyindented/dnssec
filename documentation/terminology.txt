@@ -1,0 +1,24 @@
+KSK
+    Key Signing Key
+    KSK is used to sign the DNSKEY RRset at the zone apex.
+
+ZSK
+    Zone Signing Key
+    ZSK is used to sign zone all content (no needed to
+    sign DNSKEY RRset also)
+
+USB FD
+    Universal Serial Bus Flash Drive.
+    Used as removable storage. No computers uses other storage except RAM.
+
+TEB
+    Tamper Evident Bag.
+    Used to store items such that later examination can determine if
+    someone may have had physical access to the contents. TEBs have unique
+    serial numbers.
+
+KC
+    Key Ceremony
+    Key ceremonies are tightly controlled events where keys are generated.
+    It's also the only place where the KSK is ever constructed, reconstructed
+    and used.

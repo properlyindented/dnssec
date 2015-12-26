@@ -1,0 +1,70 @@
+Key ceremonies
+    Generate KSK
+        The computer used at the key ceremony has no hard disk and no
+        swap.
+        It boots off of a "Live CD", which doesn't change between
+        ceremonies. The checksum of the boot image is publicised
+        and publically available for download.
+        Working directory during the KC is the /tmp directory
+        which is a RAM backed file system.
+        The KSKs for each zone in their unencrypted form is only ever
+        present in memory.
+        The encrypted KSKs will be stored on USB FD.
+        The secret passphrase to encrypt all KSKs is a single symmetric
+        passphrase of 1024 bit.
+        The secret passphrase is cut in 8 pieces in a memory based
+        filesystem. Each share is stored on its seperate USB FD.
+        3 shares are needed to recreate the secret.
+        "Secret USB FDs" are stored in TEBs.
+        We call these USB FDs "Cryptokeys".
+        The encrypted KSKs are stored on 3 identical USB FDs in TEBs.
+    Generate ZSK
+        ZSK is generated.
+    DNSKEY RRsets + RRSIG
+        Only the KSK is used to sign the DNSKEY RRset.
+        Result of the very first key ceremony:
+            The DNSKEY RRset contains the KSK and ZSK.
+            The RRSIG expires 5 months ahead in time.
+        Result of subsequent key ceremonies:
+            Prepublish ZSKnew (day 0 - day 2):
+                Keyset: KSK, ZSKold, ZSKnew
+                RRSIG validity: from KC to KC+5 months
+                Active ZSK: ZSKold
+            Postpublish ZSKold (day 2 - day 4)
+                Keyset: KSK, ZSKold, ZSKnew
+                RRSIG validity: from KC+2 days to KC+5 months
+                Active ZSK: ZSKnew
+            Cleanup: (day 4 - ~4 months)
+                Keyset: KSK, ZSKnew
+                RRSIG validity: from KC+4 days to KC+5 months
+                Active ZSK: ZSKnew
+
+    TRNG
+        A hardware true random number generator is used.
+        For this particular setup a Araneus Alea II has been purchased.
+        It comes with a piece of software which is called random-number.
+        We used a named FIFO pipe (see mknod) and push the binary
+        output of random-number into the named pipe. A package called
+        rng-tools provides a binary called rngd, which reads from the
+        named pipe and makes sure the kernel has entropy in /dev/random.
+    Safe is used to store
+        - Laptop
+        - Encrypted KSK
+        - TRNG
+        - Live "CD"
+
+Production
+    Production system consists of a physical server with 6+ GB RAM.
+    System boots off a USB FD "live CD", which loads the entire OS to
+    memory and runs everything from there. The system has no hard disk.
+    ZSK is stored on production signer on a USB FD disk.
+    On same USB FD is an set of DNSKEY RRsets with associated RRSIG.
+    The OS does not permit remote access to the system. It only listens
+    on port 53/UDP for NOTIFYs. After reception of a NOTIFY, it will
+    perform a full AXFR of the zone. Then it will sign the zone with the
+    appropriate ZSK and include the proper RRSIG for the DNSKEY RRset.
+
+Concepts:
+    The initial idea was to use the same KSK and ZSK for all zones,
+    however, the benefit is minimal and the difficulty in terms
+    of handling the keys seems to not be worth the effort.
