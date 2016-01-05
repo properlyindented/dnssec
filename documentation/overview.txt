@@ -1,12 +1,19 @@
+Key ceremonies (KCs) are tightly controlled sessions in which all keys are generated. It's also the only place that the KSK is ever used.
+
+It is necesary to have a key ceremony before production signing can occur.
+
 Key ceremonies
     Generate KSK
         The computer used at the key ceremony has no hard disk and no
-        swap.
-        It boots off of a "Live CD", which doesn't change between
+        swap. To make life easier, the computer is stored in a TEB between
+        KCs.
+        The computer boots off of a "Live CD", which doesn't change between
         ceremonies. The checksum of the boot image is publicised
         and publically available for download.
         Working directory during the KC is the /tmp directory
         which is a RAM backed file system.
+        On-screen logging is done via the "script" command which logs
+        tty-output to a USB FD called "logs".
         The KSKs for each zone in their unencrypted form is only ever
         present in memory.
         The encrypted KSKs will be stored on USB FD.
