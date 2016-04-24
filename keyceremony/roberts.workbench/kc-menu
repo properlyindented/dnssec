@@ -5,6 +5,7 @@ use IO::File;
 use IO::Dir;
 use Fcntl;
 use IPC::Open2;
+use English;
 use Carp;
 
 use constant {
@@ -12,9 +13,9 @@ use constant {
         CONFIGFILENAME  =>      'config.ini',
 };
 
-my $ksksecret = undef;
-my $zsksecret = undef;
 my $conf;
+my $ksksecret   = undef;
+my $zsksecret   = undef;
 
 sub setup
 {
@@ -45,6 +46,34 @@ sub setup
         };
     readconfig();
     $ENV{'PATH'} = config('GENERAL', 'path');
+}
+
+sub preflight
+{
+    if ($EFFECTIVE_USER_ID != 0)
+    {
+        die "We must run as root, so we can format USB sticks. Stopped";
+    }
+    my $programs_missing = 0;
+    my @programs = qw( blockdev lsblk parted mkfs mount umount );
+    foreach my $program (@programs)
+    {
+        my $found = 0;
+        foreach my $dir ( config('GENERAL','path') )
+        {
+            $found = 1 if -x $dir.'/'.$program;
+        }
+        if (not $found)
+        {
+            printf STDERR "Needed executable \"%s\" not found in path.\n", $program;
+            $programs_missing++;
+        }
+    }
+    if ($programs_missing)
+    {
+        exit 1;
+    }
+    `blockdev` or die;
 }
 
 sub config
@@ -218,7 +247,7 @@ sub reconstructsecret
 		my $device = shift @tmp;
 		my $partition = shift @tmp;
 		printf "Mounting %s\n", $partition;
-		if (myexec("mount $partition /mnt"))
+		if (myexec('mount', $partition, '/mnt'))
 		{
 			my @files = <"/mnt/$secretfile *">;
 			if (@files)
@@ -252,7 +281,7 @@ sub reconstructsecret
 			else {
 				printf STDERR "There are no %s files on this device.\n", $secretfile;
 			}
-			myexec("umount $partition") or die;
+			myexec('umount', $partition) or die;
 			print "You may now remove the device.\n";
 		}
 		else {
@@ -289,8 +318,8 @@ sub secretsharestomedia
 			die "$device has no size?" if not defined $size or $size eq '';
 			die "$device is too small" if $size lt 10240;
 			# Format the USB and make a single partition
-#echo "Erasing $device , creating new partition table and creating a single partition."
-#parted -s $device unit s mklabel msdos mkpart primary fat32 8064 $(( $size - 1 )) || exit 1
+                        printf "Erasing %s, creating new partition table and creating a single partition.\n", $device;
+                        myexec('parted', '-s',$device, 'unit', 's', 'mklabel', 'msdos', 'mkpart', 'primary', 'fat32', '8064', $size - 1 );
 #partition=`lsblk --list --output name --paths $usb | tail -1`
 #echo "Formatting $partition".
 #mkfs -t msdos -n PY-KC-LOGS $partition || exit 1
@@ -630,5 +659,6 @@ sub menu
 }
 
 setup();
+preflight();
 menu();
 
