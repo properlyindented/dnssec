@@ -1,46 +1,132 @@
 #!/usr/bin/perl -w
-
 use warnings;
 use strict;
 use IO::File;
 use IO::Dir;
 use Fcntl;
 use IPC::Open2;
+use Carp;
 
 use constant {
-	BITS		=>	4096,
-	RANDOMDEV	=>	'/dev/random',
-	THRESHOLD	=>	3,
-	SHARES		=>	8,
 	ZONE		=>	'templatezone',
-	SYMBITS		=>	1024,
-	CRYPTOALG	=>	'aes-256-cbc',
-	CHARS		=>	'abcdefghijklmnopqrstuvwxyz0123456789',
+        CONFIGFILENAME  =>      'config.ini',
 };
 
 my $ksksecret = undef;
-my $ksksecretfile = 'PY cryptokey';
 my $zsksecret = undef;
-my $zsksecretfile = 'PY zsk secret';
+my $conf;
 
 sub setup
 {
-	$ENV{'PATH'} .= '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/root/bin';
-	umask 077;
-	my $dir = undef;
-	my $max = 1000;
-	while ($max-- > 0)
-	{
-		$dir = '/tmp/tmp.';
-		for (my $i = 8; $i > 0; $i--)
-		{
-			$dir .= substr( CHARS, int(rand(length(CHARS))), 1);
-		}
-		mkdir ($dir, 0700) && last;
-		$dir=undef;
-	}
-	exit 1 if not defined $dir;
-	chdir $dir or die $!;
+    umask 077;
+    my $dir = mktempdir();
+    chdir $dir or die $!;
+    # Setting defaults
+    # all valid keywords must be defined here
+    $conf = {
+        'GENERAL'   => {
+                'randomdevice'          => '/dev/random',
+                'path'                  => '/usr/sbin:/usr/bin:/sbin:/bin',
+            },
+        'KSK'       => {
+                'bits'                  => 4096,
+                'secretfile'            => 'cryptokey',
+            },
+        'ZSK'       => {
+                'bits'                  => 2048,
+                'secretfile'            => 'zsk secret',
+            },
+        'SYMCRYPTO' => {
+                'm-of-n-threshold'      => 3,
+                'm-of-n-shares'         => 6,
+                'openssl-cryptoalg'     => 'aes-256-cbc',
+                'openssl-bits'          => 1024,
+            },
+        };
+    readconfig();
+    $ENV{'PATH'} = config('GENERAL', 'path');
+}
+
+sub config
+{
+    my ($section, $keyword, $value) = @_;
+    croak('No section specified,') if not defined $section;
+    croak('No keyword specified,') if not defined $keyword;
+    $conf->{$section}->{$keyword} = $value if defined $value;
+    croak('Nonexistent section,') if not exists $conf->{$section};
+    croak('Nonexistent keyword,') if not exists $conf->{$section}->{$keyword};
+    return $conf->{$section}->{$keyword};
+}
+
+sub readconfig
+{
+    local $_ = undef;
+    my $fh = IO::Dir->new(CONFIGFILENAME) or die $!;
+    my $section = undef;
+    while ($_ = $fh->getline)
+    {
+        # skip lines with comments
+        next if /^#/;
+        # strip white spaces at the end of lines.
+        s/\s+$//;
+        # skip empty lines
+        next if /^$/;
+        # locate sections
+        if (/^\[(.+)\]$/)
+        {
+            $section = uc $1;
+            if (not exists $conf->{$section})
+            {
+                die "Section named [$section] is not recognized. Stopped";
+            }
+            next;
+        }
+        # Can't get past this point without having a desired section defined.
+        if (not defined $section)
+        {
+            die "You must have a section defined in your configuration \n".
+                "file, before you set any keywords for that section. ".
+                "Stopped";
+        }
+        # Look for keyword <space> value
+        if (/^(\S+)\s+(.*)$/)
+        {
+            my $keyword = lc $1;
+            my $value   =    $2;
+            if (not exists $conf->{$section}->{$keyword})
+            {
+                die "Keyword \"$keyword\" in section [$section] is not ".
+                    "recognized. Stopped";
+            }
+            $conf->{$section}->{$keyword} = $value;
+            next;
+        }
+        die "Invalid input line \"$_\" while parsing configuration. Stopped";
+    }
+    $fh->close;
+}
+
+sub mktempdir
+{
+    my $name    = undef;
+    # If we fail 1000 times, somesthing else is wrong.
+    my $chars   = 'abcdefghijklmnopqrstuvwxyz0123456789';
+    my $length  = length $chars;
+    my $max     = 1000;
+    while ($max-- > 0)
+    {
+	    $name   = '/tmp/tmp.';
+	    for (my $i = 8; $i > 0; $i--)
+	    {
+		    $name .= substr( $chars, int(rand($length)), 1);
+	    }
+            # When the directory creation succeeds, we return its name.
+            if ( mkdir $name, 0700 )
+            {
+                return $name;
+            }
+    }
+    die $!;
 }
 
 sub myexec
@@ -69,19 +155,20 @@ sub myopen2(\$\$@)
 
 sub genkey
 {
-	my ($keytype, $BITS, $zone) = @_;
+	my ($keytype, $bits, $zone) = @_;
 	my @keytype = ();
 	@keytype = ('-f', $keytype) if uc($keytype) eq 'KSK';
-	printf "Generating %d bit key for %s\n", $BITS, $zone;
+        my $dev  = config('GENERAL', 'randomdevice');
+	printf "Generating %d bit key for %s\n", $bits, $zone;
 	myexec('dnssec-keygen',
 		'-q',
 		'-3',
 		'-a',
 		'RSASHA256',
-		'-b', $BITS,
+		'-b', $bits,
 		@keytype,
 		'-L', 86400,
-		'-r', RANDOMDEV,
+		'-r', $dev,
 		$zone
 	) || exit 1;
 }
@@ -95,13 +182,14 @@ sub packit
 
 sub gensecret
 {
-	my ($bits) = @_;
 	print "Generating secret for the symmetric encryption.\n";
-	my $secret = undef;
+	my $secret  = undef;
+        my $bits    = config('SYMCRYPTO', 'openssl-bits');
+        my $dev     = config('GENERAL',   'randomdevice');
         my ($chld_out, $chld_in);
-        my $pid = myopen2($chld_out, $chld_in, sprintf(
+        my $pid     = myopen2($chld_out, $chld_in, sprintf(
 			"openssl rand -rand %s -hex %d 2>/dev/null",
-			RANDOMDEV,
+			$dev,
 			int($bits/8),
 	));
 	while (local $_ = $chld_out->getline)
@@ -179,10 +267,11 @@ sub reconstructsecret
 
 sub secretsharestomedia
 {
-	my ($secretfile) = @_;
-	my @parts = <"$ksksecretfile *">;
-	my $threshold = $#parts + 1;
-	my $i = 0;
+	my ($secretfile)    = @_;
+        my $ksksecretfile   = config('KSK', 'secretfile');
+	my @parts           = <"$ksksecretfile *">;
+	my $threshold       = $#parts + 1;
+	my $i               = 0;
 	while ($i < $threshold)
 	{
 		printf "Insert the \"%s %d de %d\" USB FD now.\nBEWARE that the USB will be formatted.\n", $secretfile, $i+1, $threshold;
@@ -198,7 +287,7 @@ sub secretsharestomedia
 			# Get size of USB
 			my $size=`blockdev --getsz $device`;
 			die "$device has no size?" if not defined $size or $size eq '';
-			die "$device is too small" if $size -lt 10240;
+			die "$device is too small" if $size lt 10240;
 			# Format the USB and make a single partition
 #echo "Erasing $device , creating new partition table and creating a single partition."
 #parted -s $device unit s mklabel msdos mkpart primary fat32 8064 $(( $size - 1 )) || exit 1
@@ -267,11 +356,12 @@ sub encrypt
 {
 	my ($secret, $infile, $outfile) = @_;
 	die "No secret defined.\n" if not defined $secret;
-	printf("Encrypting %s package using %s.\n", $infile, CRYPTOALG);
+        my $algo = config('SYMCRYPTO', 'openssl-cryptoalg');
+	printf("Encrypting %s package using %s.\n", $infile, $algo);
         my ($chld_out, $chld_in);
         my $pid = myopen2($chld_out, $chld_in, sprintf(
 		'openssl %s -e -pass stdin -in %s -out %s',
-			CRYPTOALG,
+			$algo,
 			$infile,
 			$outfile
 		)
@@ -295,10 +385,11 @@ sub decrypt
 {
 	my ($secret, $infile, $outfile) = @_;
 	die "No secret defined.\n" if not defined $secret;
+        my $algo = config('SYMCRYPTO', 'openssl-cryptoalg');
         my ($chld_out, $chld_in);
         my $pid = myopen2($chld_out, $chld_in, sprintf(
 		'openssl %s -d -pass stdin -in %s -out %s',
-			CRYPTOALG,
+			$algo,
 			$infile,
 			$outfile
 		)
@@ -441,7 +532,12 @@ sub araneus
 sub menu
 {
 	$| = 1;
-	my $choice = '';
+	my $choice          = '';
+        my $algo            = config('SYMCRYPTO',   'openssl-cryptoalg' );
+        my $ksksecretfile   = config('KSK',         'secretfile'        );
+        my $zsksecretfile   = config('ZSK',         'secretfile'        );
+        my $shares          = config('SYMCRYPTO',   'm-of-n-shares'     );
+        my $threshold       = config('SYMCRYPTO',   'm-of-n-threshold'  );
 	while ($choice ne 'Q')
 	{
 		my (@_ksk, @_zsk, @_random, @_misc);
@@ -450,15 +546,15 @@ sub menu
 		push @_ksk,    '[ KR ] Reconstruct PY-cryptokey secret from shares.'	if not defined $ksksecret;
 		push @_ksk,    '[ KF ] Forget PY-cryptokey (memory version).'		if defined $ksksecret;
 		push @_ksk,    '[ KU ] Copy PY-cryptokey to USB shares.'		if <"$ksksecretfile *">;
-		push @_ksk,    '[ KG ] Generate KSK'					if not -e 'ksk.tar' and not -e 'ksk.tar.'.CRYPTOALG;
-		push @_ksk,    '[ KE ] KSK encrypt.'					if defined $ksksecret and -e 'ksk.tar' and not -e 'ksk.tar.'.CRYPTOALG;
-		push @_ksk,    '[ KC ] Copy encrypted KSK to removable media.'		if -e 'ksk.tar.'.CRYPTOALG;
+		push @_ksk,    '[ KG ] Generate KSK'					if not -e 'ksk.tar' and not -e "ksk.tar.$algo";
+		push @_ksk,    '[ KE ] KSK encrypt.'					if defined $ksksecret and -e 'ksk.tar' and not -e "ksk.tar.$algo";
+		push @_ksk,    '[ KC ] Copy encrypted KSK to removable media.'		if -e "ksk.tar.$algo";
 		push @_zsk,    'ZSK';
 		push @_zsk,    '[ ZS ] Generate secret for ZSK transport.'		if not defined $zsksecret;
 	#	push @_zsk,    '[ ZR ] Reconstruct ZSK secret from shares.'		if not defined $zsksecret;
 		push @_zsk,    '[ ZF ] Forget ZSK secret (memory version).'		if defined $zsksecret;
 		push @_zsk,    '[ ZG ] Generate ZSK key.'				if defined $zsksecret;
-		push @_zsk,    '[ ZC ] Copy ZSK to removable media.'			if -e 'zsk.tar.'.CRYPTOALG;;
+		push @_zsk,    '[ ZC ] Copy ZSK to removable media.'			if -e "zsk.tar.$algo";
 		push @_misc,   'Misc';
 		push @_misc,   '[ CS ] Ceremony sign.'					if -e 'ksk.tar';
 		push @_misc,   '[ R  ] start Random number generator.';
@@ -484,8 +580,8 @@ sub menu
 		$choice =~ s/[\r\n]+//g;
 		# KSK
 		if    ($choice eq 'KS') {
-			$ksksecret = gensecret( SYMBITS );
-			ssss_split($ksksecret, $ksksecretfile, THRESHOLD, SHARES);
+			$ksksecret = gensecret();
+			ssss_split($ksksecret, $ksksecretfile, $threshold, $shares);
 		}
 		elsif ($choice eq 'KR') {	
 			$ksksecret = reconstructsecret( 3, $ksksecretfile );
@@ -503,16 +599,16 @@ sub menu
 			unlink <K*>;
 		}
 		elsif ($choice eq 'KE') {
-			encrypt($ksksecret, 'ksk.tar', 'ksk.tar.'.CRYPTOALG);
+			encrypt($ksksecret, 'ksk.tar', "ksk.tar.$algo");
 			unlink 'ksk.tar';
 		}
 		elsif ($choice eq 'KC') {
-			copy('ksk.tar.'.CRYPTOALG);
+			copy("ksk.tar.$algo");
 		}
 		# ZSK
 		if    ($choice eq 'ZS') {
-			$zsksecret = gensecret( SYMBITS );
-			ssss_split($zsksecret, $zsksecretfile, THRESHOLD, SHARES);
+			$zsksecret = gensecret();
+			ssss_split($zsksecret, $zsksecretfile, $threshold, $shares);
 		}
 		elsif ($choice eq 'ZR') {	
 			$zsksecret = reconstructsecret( 2, $zsksecretfile );
@@ -533,6 +629,6 @@ sub menu
 	}
 }
 
-setup;
-menu;
+setup();
+menu();
 
